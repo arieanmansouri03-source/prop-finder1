@@ -1,412 +1,276 @@
-FROM python:3.11-slim
+# --- minimal, production-ready FastAPI app (frontend+backend i en fil) ---
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional, Dict
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import json
 
-WORKDIR /app
+# ---------- storage ----------
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+HIST_DIR = DATA_DIR / "historical"
+HIST_DIR.mkdir(parents=True, exist_ok=True)
 
-# Skapa mappar
-RUN mkdir -p backend/engine frontend backend/data/historical
+app = FastAPI(title="Prop Finder", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
 
-# --- requirements.txt ---
-RUN /bin/sh -lc 'cat > backend/requirements.txt << "EOF"\n\
-fastapi==0.115.0\n\
-uvicorn==0.30.6\n\
-pydantic==2.8.2\n\
-python-multipart==0.0.9\n\
-pandas==2.2.2\n\
-numpy==1.26.4\n\
-EOF'
+# ---------- engine (EV + backtest) ----------
+def remove_vig_two_way(p1, p2):
+    p1, p2 = float(p1 or 0.0), float(p2 or 0.0)
+    s = p1 + p2
+    if s <= 0: return 0.5, 0.5
+    return p1/s, p2/s
 
-RUN pip install --no-cache-dir -r backend/requirements.txt
+def remove_vig_three_way(ph, pd, pa):
+    ph, pd, pa = float(ph or 0.0), float(pd or 0.0), float(pa or 0.0)
+    s = ph + pd + pa
+    if s <= 0: return 1/3, 1/3, 1/3
+    return ph/s, pd/s, pa/s
 
-# --- backend/engine/odds.py ---
-RUN /bin/sh -lc 'cat > backend/engine/odds.py << "EOF"\n\
-import json\n\
-from typing import Tuple, Dict\n\
-\n\
-def decimal_to_prob(d: float) -> float:\n\
-    return 1.0 / d if d else 0.0\n\
-\n\
-def remove_vig_two_way(p_over_raw: float, p_under_raw: float) -> Tuple[float, float]:\n\
-    s = (p_over_raw or 0.0) + (p_under_raw or 0.0)\n\
-    if s <= 0:\n\
-        return 0.5, 0.5\n\
-    return (p_over_raw or 0.0) / s, (p_under_raw or 0.0) / s\n\
-\n\
-def remove_vig_three_way(ph: float, pd: float, pa: float):\n\
-    s = (ph or 0.0) + (pd or 0.0) + (pa or 0.0)\n\
-    if s <= 0:\n\
-        return 1/3, 1/3, 1/3\n\
-    return (ph or 0.0) / s, (pd or 0.0) / s, (pa or 0.0) / s\n\
-\n\
-def remove_vig_nway(prob_map: Dict[str, float]) -> Dict[str, float]:\n\
-    s = sum((v or 0.0) for v in prob_map.values())\n\
-    if s <= 0:\n\
-        n = max(1, len(prob_map))\n\
-        return {k: 1.0/n for k in prob_map}\n\
-    return {k: (v or 0.0) / s for k, v in prob_map.items()}\n\
-\n\
-def ev_decimal(price_decimal: float, p_fair: float) -> float:\n\
-    return p_fair * (price_decimal - 1.0) - (1.0 - p_fair)\n\
-\n\
-def compute_ev_row(row):\n\
-    side = str(row.get(\"side\") or \"\").upper()\n\
-    price = float(row.get(\"price_bet365\") or 0.0)\n\
-    market_class = str(row.get(\"market_class\") or \"\").upper()\n\
-\n\
-    if market_class == \"OU\" or side in [\"OVER\",\"UNDER\"]:\n\
-        p_over_raw = float(row.get(\"baseline_over_prob\", 0.0) or 0.0)\n\
-        p_under_raw = float(row.get(\"baseline_under_prob\", 0.0) or 0.0)\n\
-        p_over, p_under = remove_vig_two_way(p_over_raw, p_under_raw)\n\
-        p_fair = p_over if side == \"OVER\" else p_under\n\
-        return ev_decimal(price, p_fair), p_fair\n\
-\n\
-    if market_class == \"YN\" or side in [\"YES\", \"NO\"]:\n\
-        p_yes_raw = float(row.get(\"baseline_yes_prob\", 0.0) or 0.0)\n\
-        p_no_raw  = float(row.get(\"baseline_no_prob\", 1.0 - p_yes_raw) or (1.0 - p_yes_raw))\n\
-        p_yes, p_no = remove_vig_two_way(p_yes_raw, p_no_raw)\n\
-        p_fair = p_yes if side == \"YES\" else p_no\n\
-        return ev_decimal(price, p_fair), p_fair\n\
-\n\
-    if market_class == \"THREE_WAY\" or side in [\"HOME\",\"DRAW\",\"AWAY\"]:\n\
-        ph = float(row.get(\"baseline_home_prob\", 0.0) or 0.0)\n\
-        pd = float(row.get(\"baseline_draw_prob\", 0.0) or 0.0)\n\
-        pa = float(row.get(\"baseline_away_prob\", 0.0) or 0.0)\n\
-        ph, pd, pa = remove_vig_three_way(ph, pd, pa)\n\
-        mapping = {\"HOME\": ph, \"DRAW\": pd, \"AWAY\": pa}\n\
-        p_fair = mapping.get(side, 0.0)\n\
-        return ev_decimal(price, p_fair), p_fair\n\
-\n\
-    if market_class == \"N_WAY\":\n\
-        probs = row.get(\"baseline_probs_json\") or row.get(\"probs_json\")\n\
-        if isinstance(probs, str):\n\
-            try:\n\
-                probs = json.loads(probs or \"{}\")\n\
-            except Exception:\n\
-                probs = {}\n\
-        probs = {str(k).upper(): float(v or 0.0) for k, v in (probs or {}).items()}\n\
-        probs = remove_vig_nway(probs)\n\
-        p_fair = probs.get(side, 0.0)\n\
-        return ev_decimal(price, p_fair), p_fair\n\
-\n\
-    if market_class == \"BAND\":\n\
-        probs = row.get(\"band_probs_json\")\n\
-        if isinstance(probs, str):\n\
-            try:\n\
-                probs = json.loads(probs or \"{}\")\n\
-            except Exception:\n\
-                probs = {}\n\
-        probs = {str(k): float(v or 0.0) for k, v in (probs or {}).items()}\n\
-        probs = remove_vig_nway(probs)\n\
-        p_fair = probs.get(row.get(\"side\"), 0.0)\n\
-        return ev_decimal(price, p_fair), p_fair\n\
-\n\
-    if market_class == \"JOINT\":\n\
-        p_joint = float(row.get(\"joint_prob\", 0.0) or 0.0)\n\
-        return ev_decimal(price, p_joint), p_joint\n\
-\n\
-    p_fair = float(row.get(\"model_prob\", 0.0) or 0.0)\n\
-    return ev_decimal(price, p_fair), p_fair\n\
-EOF'
+def remove_vig_nway(prob_map: dict):
+    s = sum(float(v or 0.0) for v in prob_map.values())
+    if s <= 0:
+        n = max(1, len(prob_map))
+        return {k: 1.0/n for k in prob_map}
+    return {k: float(v or 0.0)/s for k,v in prob_map.items()}
 
-# --- backend/engine/backtest.py ---
-RUN /bin/sh -lc 'cat > backend/engine/backtest.py << "EOF"\n\
-from pathlib import Path\n\
-import pandas as pd\n\
-import numpy as np\n\
-from .odds import compute_ev_row\n\
-\n\
-_CACHE = {\"edges\": None, \"summary\": None}\n\
-\n\
-def latest_results():\n\
-    return _CACHE if _CACHE.get(\"summary\") else None\n\
-\n\
-def _load_csvs(data_dir: Path) -> pd.DataFrame:\n\
-    files = sorted((data_dir / \"historical\").glob(\"*.csv\"))\n\
-    if not files:\n\
-        return pd.DataFrame()\n\
-    dfs = [pd.read_csv(f) for f in files]\n\
-    df = pd.concat(dfs, ignore_index=True)\n\
-    if \"event_datetime\" in df.columns:\n\
-        df[\"event_datetime\"] = pd.to_datetime(df[\"event_datetime\"], errors=\"coerce\")\n\
-    return df\n\
-\n\
-def run_backtest(data_dir: Path, edge_threshold: float = 0.02, kelly_fraction: float = 0.5):\n\
-    df = _load_csvs(data_dir)\n\
-    if df.empty:\n\
-        _CACHE[\"edges\"] = pd.DataFrame()\n\
-        _CACHE[\"summary\"] = {\"n_bets\": 0, \"roi\": 0.0, \"pnl\": 0.0, \"hit_rate\": 0.0, \"kelly_fraction\": kelly_fraction, \"by_sport\": {}}\n\
-        return _CACHE[\"summary\"]\n\
-\n\
-    evs, pfs = [], []\n\
-    for _, r in df.iterrows():\n\
-        ev, p = compute_ev_row(r)\n\
-        evs.append(ev); pfs.append(p)\n\
-    df[\"p_fair\"] = pfs\n\
-    df[\"edge\"] = evs\n\
-\n\
-    sel = df[df[\"edge\"] >= edge_threshold].copy()\n\
-    if sel.empty:\n\
-        _CACHE[\"edges\"] = df\n\
-        _CACHE[\"summary\"] = {\"n_bets\": 0, \"roi\": 0.0, \"pnl\": 0.0, \"hit_rate\": 0.0, \"kelly_fraction\": kelly_fraction, \"by_sport\": {}}\n\
-        return _CACHE[\"summary\"]\n\
-\n\
-    d = sel[\"price_bet365\"].astype(float)\n\
-    p = sel[\"p_fair\"].astype(float)\n\
-    kelly_star = (p * d - 1.0) / (d - 1.0)\n\
-    kelly_star = kelly_star.clip(lower=0.0, upper=0.5)\n\
-    sel[\"stake\"] = kelly_star * kelly_fraction\n\
-\n\
-    won = sel[\"outcome\"].astype(int)\n\
-    sel[\"pnl\"] = np.where(won == 1, sel[\"stake\"] * (d - 1.0), -sel[\"stake\"])\n\
-\n\
-    total_staked = sel[\"stake\"].sum()\n\
-    total_pnl = sel[\"pnl\"].sum()\n\
-    roi = (total_pnl / total_staked) if total_staked > 0 else 0.0\n\
-    hit_rate = won.mean()\n\
-\n\
-    by_sport = (\n\
-        sel.groupby(\"sport\")\n\
-        .agg(n_bets=(\"sport\", \"size\"), pnl=(\"pnl\", \"sum\"), staked=(\"stake\", \"sum\"))\n\
-        .assign(roi=lambda x: x[\"pnl\"] / x[\"staked\"])\n\
-        .to_dict(orient=\"index\")\n\
-    )\n\
-\n\
-    _CACHE[\"edges\"] = sel.sort_values(\"edge\", ascending=False).reset_index(drop=True)\n\
-    _CACHE[\"summary\"] = {\n\
-        \"n_bets\": int(sel.shape[0]),\n\
-        \"roi\": float(roi),\n\
-        \"pnl\": float(total_pnl),\n\
-        \"hit_rate\": float(hit_rate),\n\
-        \"kelly_fraction\": float(kelly_fraction),\n\
-        \"by_sport\": {k: {\"n_bets\": int(v[\"n_bets\"]), \"pnl\": float(v[\"pnl\"]), \"staked\": float(v[\"staked\"]), \"roi\": float(v[\"roi\"])} for k, v in by_sport.items()},\n\
-    }\n\
-    return _CACHE[\"summary\"]\n\
-EOF'
+def ev_decimal(price_decimal: float, p_fair: float) -> float:
+    d = float(price_decimal or 0.0)
+    p = float(p_fair or 0.0)
+    return p * (d - 1.0) - (1.0 - p)
 
-# --- backend/main.py (API + serverar frontend) ---
-RUN /bin/sh -lc 'cat > backend/main.py << "EOF"\n\
-from fastapi import FastAPI, UploadFile, File, Form\n\
-from fastapi.middleware.cors import CORSMiddleware\n\
-from fastapi.staticfiles import StaticFiles\n\
-from fastapi.responses import FileResponse\n\
-from pydantic import BaseModel\n\
-from typing import Optional, Dict\n\
-from pathlib import Path\n\
-import pandas as pd\n\
-import json\n\
-\n\
-from engine.backtest import run_backtest, latest_results\n\
-\n\
-BASE_DIR = Path(__file__).parent\n\
-DATA_DIR = BASE_DIR / \"data\"\n\
-HIST_DIR = DATA_DIR / \"historical\"\n\
-HIST_DIR.mkdir(parents=True, exist_ok=True)\n\
-FRONTEND_DIR = (BASE_DIR.parent / \"frontend\").resolve()\n\
-\n\
-app = FastAPI(title=\"EdgeForge API\", version=\"0.1.0\")\n\
-\n\
-app.add_middleware(\n\
-    CORSMiddleware,\n\
-    allow_origins=[\"*\"],\n\
-    allow_credentials=True,\n\
-    allow_methods=[\"*\"],\n\
-    allow_headers=[\"*\"],\n\
-)\n\
-\n\
-if FRONTEND_DIR.exists():\n\
-    app.mount(\"/static\", StaticFiles(directory=FRONTEND_DIR, html=False), name=\"static\")\n\
-\n\
-class BacktestResponse(BaseModel):\n\
-    n_bets: int\n\
-    roi: float\n\
-    pnl: float\n\
-    hit_rate: float\n\
-    kelly_fraction: float\n\
-    by_sport: Dict[str, Dict[str, float]]\n\
-\n\
-@app.get(\"/\")\n\
-def serve_index():\n\
-    index_path = FRONTEND_DIR / \"index.html\"\n\
-    if index_path.exists():\n\
-        return FileResponse(index_path)\n\
-    return {\"ok\": True, \"message\": \"EdgeForge API running\"}\n\
-\n\
-@app.post(\"/api/data/upload\")\n\
-async def upload_csv(file: UploadFile = File(...)):\n\
-    contents = await file.read()\n\
-    out = HIST_DIR / file.filename\n\
-    out.write_bytes(contents)\n\
-    try:\n\
-        _ = pd.read_csv(out, nrows=2)\n\
-    except Exception as e:\n\
-        out.unlink(missing_ok=True)\n\
-        return {\"ok\": False, \"error\": str(e)}\n\
-    return {\"ok\": True, \"filename\": file.filename}\n\
-\n\
-@app.post(\"/api/backtest/run\", response_model=BacktestResponse)\n\
-async def api_backtest_run(edge_threshold: float = 0.02, kelly_fraction: float = 0.5):\n\
-    summary = run_backtest(DATA_DIR, edge_threshold=edge_threshold, kelly_fraction=kelly_fraction)\n\
-    return BacktestResponse(**summary)\n\
-\n\
-@app.get(\"/api/edges\")\n\
-async def api_edges(min_edge: float = 0.02, sport: Optional[str] = None, limit: int = 500):\n\
-    res = latest_results()\n\
-    if not res or res.get(\"edges\") is None:\n\
-        return []\n\
-    df = res[\"edges\"].copy()\n\
-    if sport:\n\
-        df = df[df[\"sport\"].astype(str).str.upper() == sport.upper()]\n\
-    df = df[df[\"edge\"] >= min_edge].sort_values(\"edge\", ascending=False).head(limit)\n\
-    return df.to_dict(orient=\"records\")\n\
-EOF'
+def compute_ev_row(r: dict):
+    side = str(r.get("side") or "").upper()
+    market_class = str(r.get("market_class") or "").upper()
+    price = float(r.get("price_bet365") or 0.0)
 
-# --- frontend/index.html (enkel admin UI) ---
-RUN /bin/sh -lc 'cat > frontend/index.html << "EOF"\n\
-<!doctype html>\n\
-<html lang=\"sv\">\n\
-<head>\n\
-  <meta charset=\"utf-8\" />\n\
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\
-  <title>EdgeForge</title>\n\
-  <script src=\"https://cdn.tailwindcss.com\"></script>\n\
-</head>\n\
-<body class=\"bg-slate-50\">\n\
-  <div class=\"max-w-6xl mx-auto p-6 space-y-6\">\n\
-    <header>\n\
-      <h1 class=\"text-3xl font-bold text-slate-900\">EdgeForge</h1>\n\
-      <p class=\"text-slate-600\">Ladda upp historik och kör backtest (+EV för player props).</p>\n\
-    </header>\n\
-\n\
-    <section class=\"bg-white rounded-2xl shadow p-5\">\n\
-      <h2 class=\"text-xl font-semibold mb-3\">1) Ladda upp historisk CSV</h2>\n\
-      <input id=\"csv\" type=\"file\" accept=\".csv\" class=\"block\">\n\
-      <button id=\"upload\" class=\"mt-3 px-4 py-2 rounded-xl border\">Ladda upp</button>\n\
-      <div id=\"upload-status\" class=\"mt-2 text-slate-600\"></div>\n\
-    </section>\n\
-\n\
-    <section class=\"bg-white rounded-2xl shadow p-5\">\n\
-      <h2 class=\"text-xl font-semibold mb-3\">2) Kör backtest</h2>\n\
-      <div class=\"flex flex-wrap gap-3 items-end\">\n\
-        <label class=\"block\">\n\
-          <span class=\"text-sm text-slate-600\">Edge-tröskel</span>\n\
-          <input id=\"edge-threshold\" type=\"number\" step=\"0.01\" value=\"0.02\" class=\"mt-1 w-32 border rounded-xl px-3 py-2\">\n\
-        </label>\n\
-        <label class=\"block\">\n\
-          <span class=\"text-sm text-slate-600\">Kelly-fraktion</span>\n\
-          <input id=\"kelly\" type=\"number\" step=\"0.1\" value=\"0.5\" class=\"mt-1 w-32 border rounded-xl px-3 py-2\">\n\
-        </label>\n\
-        <button id=\"run\" class=\"px-4 py-2 rounded-xl bg-emerald-600 text-white\">Kör</button>\n\
-        <span id=\"run-status\" class=\"text-slate-600\"></span>\n\
-      </div>\n\
-      <div class=\"grid md:grid-cols-3 gap-4 mt-4\">\n\
-        <div class=\"bg-slate-50 rounded-xl p-4 border\">\n\
-          <div class=\"text-sm text-slate-500\">Bets</div>\n\
-          <div id=\"stat-bets\" class=\"text-2xl font-semibold\">–</div>\n\
-        </div>\n\
-        <div class=\"bg-slate-50 rounded-xl p-4 border\">\n\
-          <div class=\"text-sm text-slate-500\">ROI</div>\n\
-          <div id=\"stat-roi\" class=\"text-2xl font-semibold\">–</div>\n\
-        </div>\n\
-        <div class=\"bg-slate-50 rounded-xl p-4 border\">\n\
-          <div class=\"text-sm text-slate-500\">Hit rate</div>\n\
-          <div id=\"stat-hit\" class=\"text-2xl font-semibold\">–</div>\n\
-        </div>\n\
-      </div>\n\
-    </section>\n\
-\n\
-    <section class=\"bg-white rounded-2xl shadow p-5\">\n\
-      <div class=\"flex flex-wrap items-center gap-3 justify-between\">\n\
-        <h2 class=\"text-xl font-semibold\">Edges</h2>\n\
-        <div class=\"flex gap-2\">\n\
-          <input id=\"filter-sport\" class=\"border rounded-xl px-3 py-2 w-36\" placeholder=\"FOOTBALL\">\n\
-          <label class=\"flex items-center gap-2\">\n\
-            <span class=\"text-sm text-slate-600\">Min edge</span>\n\
-            <input id=\"filter-min-edge\" type=\"number\" step=\"0.01\" value=\"0.02\" class=\"w-28 border rounded-xl px-3 py-2\">\n\
-          </label>\n\
-          <button id=\"refresh\" class=\"px-4 py-2 rounded-xl border\">Uppdatera</button>\n\
-        </div>\n\
-      </div>\n\
-      <div class=\"overflow-x-auto mt-4\">\n\
-        <table class=\"min-w-full text-sm\">\n\
-          <thead class=\"bg-slate-100 text-slate-700\">\n\
-            <tr>\n\
-              <th class=\"p-2 text-left\">Sport</th>\n\
-              <th class=\"p-2 text-left\">Liga</th>\n\
-              <th class=\"p-2 text-left\">Marknad</th>\n\
-              <th class=\"p-2 text-left\">Spelare</th>\n\
-              <th class=\"p-2 text-left\">Sida</th>\n\
-              <th class=\"p-2 text-left\">Line</th>\n\
-              <th class=\"p-2 text-left\">Pris</th>\n\
-              <th class=\"p-2 text-left\">p_fair</th>\n\
-              <th class=\"p-2 text-left\">Edge</th>\n\
-              <th class=\"p-2 text-left\">Stake</th>\n\
-              <th class=\"p-2 text-left\">PnL</th>\n\
-            </tr>\n\
-          </thead>\n\
-          <tbody id=\"edges-body\"></tbody>\n\
-        </table>\n\
-      </div>\n\
-    </section>\n\
-  </div>\n\
-\n\
-<script>\n\
-const API = \"\"; // samma origin\n\
-document.getElementById(\"upload\").onclick = async () => {\n\
-  const f = document.getElementById(\"csv\").files[0];\n\
-  if(!f){ document.getElementById(\"upload-status\").textContent = \"Välj en CSV först.\"; return; }\n\
-  const fd = new FormData(); fd.append(\"file\", f);\n\
-  const r = await fetch(\"/api/data/upload\", { method:\"POST\", body: fd });\n\
-  const j = await r.json();\n\
-  document.getElementById(\"upload-status\").textContent = j.ok ? (\"Uppladdad: \"+j.filename) : (\"Fel: \"+j.error);\n\
-};\n\
-document.getElementById(\"run\").onclick = async () => {\n\
-  const edge = parseFloat(document.getElementById(\"edge-threshold\").value || \"0.02\");\n\
-  const kelly = parseFloat(document.getElementById(\"kelly\").value || \"0.5\");\n\
-  const r = await fetch(`/api/backtest/run?edge_threshold=${edge}&kelly_fraction=${kelly}`, { method:\"POST\" });\n\
-  const j = await r.json();\n\
-  document.getElementById(\"stat-bets\").textContent = j.n_bets;\n\
-  document.getElementById(\"stat-roi\").textContent = (j.roi*100).toFixed(2)+\"%\";\n\
-  document.getElementById(\"stat-hit\").textContent = (j.hit_rate*100).toFixed(1)+\"%\";\n\
-  document.getElementById(\"run-status\").textContent = \"Backtest klart.\";\n\
-  loadEdges();\n\
-};\n\
-document.getElementById(\"refresh\").onclick = () => loadEdges();\n\
-async function loadEdges(){\n\
-  const sport = document.getElementById(\"filter-sport\").value;\n\
-  const minEdge = document.getElementById(\"filter-min-edge\").value || 0.02;\n\
-  const url = new URL(window.location.origin + \"/api/edges\");\n\
-  if (sport) url.searchParams.set(\"sport\", sport);\n\
-  url.searchParams.set(\"min_edge\", minEdge);\n\
-  url.searchParams.set(\"limit\", 500);\n\
-  const r = await fetch(url);\n\
-  const edges = await r.json();\n\
-  const tbody = document.getElementById(\"edges-body\");\n\
-  tbody.innerHTML = \"\";\n\
-  edges.forEach(e => {\n\
-    const tr = document.createElement(\"tr\");\n\
-    tr.className = \"border-b last:border-0\";\n\
-    tr.innerHTML = `\n\
-      <td class=\"p-2\">${e.sport||\"\"}</td>\n\
-      <td class=\"p-2\">${e.league||\"\"}</td>\n\
-      <td class=\"p-2\">${e.market_type||\"\"}</td>\n\
-      <td class=\"p-2\">${e.player||\"\"}</td>\n\
-      <td class=\"p-2\">${e.side||\"\"}</td>\n\
-      <td class=\"p-2\">${e.line??\"\"}</td>\n\
-      <td class=\"p-2\">${e.price_bet365??\"\"}</td>\n\
-      <td class=\"p-2\">${Number(e.p_fair||0).toFixed(3)}</td>\n\
-      <td class=\"p-2 font-medium\">${Number(e.edge||0).toFixed(3)}</td>\n\
-      <td class=\"p-2\">${Number(e.stake||0).toFixed(3)}</td>\n\
-      <td class=\"p-2 ${e.pnl>=0 ? 'text-emerald-600':'text-rose-600'}\">${Number(e.pnl||0).toFixed(3)}</td>\n\
-    `;\n\
-    tbody.appendChild(tr);\n\
-  });\n\
-}\n\
-</script>\n\
-</body>\n\
-</html>\n\
-EOF'
+    # OU
+    if market_class == "OU" or side in ["OVER","UNDER"]:
+        p_over_raw = float(r.get("baseline_over_prob", 0.0) or 0.0)
+        p_under_raw = float(r.get("baseline_under_prob", 0.0) or 0.0)
+        p_over, p_under = remove_vig_two_way(p_over_raw, p_under_raw)
+        p_fair = p_over if side == "OVER" else p_under
+        return ev_decimal(price, p_fair), p_fair
 
-# Kör servern
-WORKDIR /app/backend
-ENV PORT=8000
-EXPOSE 8000
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]
+    # YN
+    if market_class == "YN" or side in ["YES","NO"]:
+        p_yes_raw = float(r.get("baseline_yes_prob", 0.0) or 0.0)
+        p_no_raw  = float(r.get("baseline_no_prob", 1.0 - p_yes_raw) or (1.0 - p_yes_raw))
+        p_yes, p_no = remove_vig_two_way(p_yes_raw, p_no_raw)
+        p_fair = p_yes if side == "YES" else p_no
+        return ev_decimal(price, p_fair), p_fair
+
+    # THREE_WAY
+    if market_class == "THREE_WAY" or side in ["HOME","DRAW","AWAY"]:
+        ph = float(r.get("baseline_home_prob", 0.0) or 0.0)
+        pd = float(r.get("baseline_draw_prob", 0.0) or 0.0)
+        pa = float(r.get("baseline_away_prob", 0.0) or 0.0)
+        ph, pd, pa = remove_vig_three_way(ph, pd, pa)
+        mapping = {"HOME": ph, "DRAW": pd, "AWAY": pa}
+        p_fair = mapping.get(side, 0.0)
+        return ev_decimal(price, p_fair), p_fair
+
+    # N_WAY
+    if market_class == "N_WAY":
+        probs = r.get("baseline_probs_json") or r.get("probs_json") or "{}"
+        if isinstance(probs, str):
+            try: probs = json.loads(probs)
+            except: probs = {}
+        probs = {str(k).upper(): float(v or 0.0) for k,v in probs.items()}
+        probs = remove_vig_nway(probs)
+        p_fair = probs.get(side, 0.0)
+        return ev_decimal(price, p_fair), p_fair
+
+    # BAND
+    if market_class == "BAND":
+        probs = r.get("band_probs_json") or "{}"
+        if isinstance(probs, str):
+            try: probs = json.loads(probs)
+            except: probs = {}
+        probs = {str(k): float(v or 0.0) for k,v in probs.items()}
+        probs = remove_vig_nway(probs)
+        p_fair = probs.get(r.get("side"), 0.0)
+        return ev_decimal(price, p_fair), p_fair
+
+    # JOINT
+    if market_class == "JOINT":
+        p_joint = float(r.get("joint_prob", 0.0) or 0.0)
+        return ev_decimal(price, p_joint), p_joint
+
+    # fallback
+    p_fair = float(r.get("model_prob", 0.0) or 0.0)
+    return ev_decimal(price, p_fair), p_fair
+
+_CACHE = {"edges": None, "summary": None}
+
+def latest_results(): return _CACHE if _CACHE.get("summary") else None
+
+def _load_csvs(data_dir: Path) -> pd.DataFrame:
+    files = sorted((data_dir / "historical").glob("*.csv"))
+    if not files: return pd.DataFrame()
+    dfs = [pd.read_csv(f) for f in files]
+    df = pd.concat(dfs, ignore_index=True)
+    if "event_datetime" in df.columns:
+        df["event_datetime"] = pd.to_datetime(df["event_datetime"], errors="coerce")
+    return df
+
+def run_backtest(data_dir: Path, edge_threshold: float = 0.02, kelly_fraction: float = 0.5):
+    df = _load_csvs(data_dir)
+    if df.empty:
+        _CACHE["edges"] = pd.DataFrame()
+        _CACHE["summary"] = {"n_bets": 0, "roi": 0.0, "pnl": 0.0,
+                             "hit_rate": 0.0, "kelly_fraction": kelly_fraction, "by_sport": {}}
+        return _CACHE["summary"]
+
+    evs, pfs = [], []
+    for _, r in df.iterrows():
+        ev, p = compute_ev_row(r)
+        evs.append(ev); pfs.append(p)
+    df["p_fair"] = pfs
+    df["edge"] = evs
+
+    sel = df[df["edge"] >= edge_threshold].copy()
+    if sel.empty:
+        _CACHE["edges"] = df
+        _CACHE["summary"] = {"n_bets": 0, "roi": 0.0, "pnl": 0.0,
+                             "hit_rate": 0.0, "kelly_fraction": kelly_fraction, "by_sport": {}}
+        return _CACHE["summary"]
+
+    d = sel["price_bet365"].astype(float)
+    p = sel["p_fair"].astype(float)
+    kelly_star = (p * d - 1.0) / (d - 1.0)
+    kelly_star = kelly_star.clip(lower=0.0, upper=0.5)
+    sel["stake"] = kelly_star * kelly_fraction
+
+    won = sel["outcome"].astype(int)
+    sel["pnl"] = np.where(won == 1, sel["stake"] * (d - 1.0), -sel["stake"])
+
+    total_staked = sel["stake"].sum()
+    total_pnl = sel["pnl"].sum()
+    roi = (total_pnl / total_staked) if total_staked > 0 else 0.0
+    hit_rate = won.mean()
+
+    by_sport = (
+        sel.groupby("sport").agg(n_bets=("sport","size"), pnl=("pnl","sum"), staked=("stake","sum"))
+        .assign(roi=lambda x: x["pnl"]/x["staked"]).to_dict(orient="index")
+    )
+
+    _CACHE["edges"] = sel.sort_values("edge", ascending=False).reset_index(drop=True)
+    _CACHE["summary"] = {
+        "n_bets": int(sel.shape[0]), "roi": float(roi), "pnl": float(total_pnl),
+        "hit_rate": float(hit_rate), "kelly_fraction": float(kelly_fraction),
+        "by_sport": {k: {"n_bets": int(v["n_bets"]), "pnl": float(v["pnl"]),
+                         "staked": float(v["staked"]), "roi": float(v["roi"])} for k,v in by_sport.items()}
+    }
+    return _CACHE["summary"]
+
+# ---------- API ----------
+class BacktestResponse(BaseModel):
+    n_bets: int
+    roi: float
+    pnl: float
+    hit_rate: float
+    kelly_fraction: float
+    by_sport: Dict[str, Dict[str, float]]
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    # Minimal frontend direkt från Python (ingen extra fil)
+    return HTMLResponse("""
+<!doctype html><html lang='sv'><meta charset='utf-8'>
+<title>Prop Finder</title>
+<meta name=viewport content='width=device-width,initial-scale=1'>
+<link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/water.css@2/out/water.css'>
+<h1>Prop Finder</h1>
+<p>Ladda upp historik (CSV) och kör backtest.</p>
+<h3>Ladda upp CSV</h3>
+<input id=f type=file accept=.csv>
+<button id=u>Ladda upp</button>
+<div id=us></div>
+<h3>Kör backtest</h3>
+<label>Edge-tröskel <input id=e type=number step=0.01 value=0.02></label>
+<label>Kelly-fraktion <input id=k type=number step=0.1 value=0.5></label>
+<button id=r>Kör</button>
+<div id=stats></div>
+<h3>Edges</h3>
+<label>Sportfilter <input id=s placeholder='FOOTBALL'></label>
+<label>Min edge <input id=me type=number step=0.01 value=0.02></label>
+<button id=ref>Uppdatera</button>
+<table id=t></table>
+<script>
+const up=document.getElementById('u'), f=document.getElementById('f'), us=document.getElementById('us');
+const r=document.getElementById('r'), e=document.getElementById('e'), k=document.getElementById('k'), stats=document.getElementById('stats');
+const ref=document.getElementById('ref'), t=document.getElementById('t'), s=document.getElementById('s'), me=document.getElementById('me');
+
+up.onclick=async()=>{
+  if(!f.files[0]){us.textContent='Välj en CSV först.';return;}
+  const fd=new FormData(); fd.append('file', f.files[0]);
+  const res=await fetch('/api/data/upload',{method:'POST',body:fd}); const j=await res.json();
+  us.textContent=j.ok?('Uppladdad: '+j.filename):('Fel: '+j.error);
+};
+
+r.onclick=async()=>{
+  const res=await fetch(`/api/backtest/run?edge_threshold=${e.value||0.02}&kelly_fraction=${k.value||0.5}`,{method:'POST'});
+  const j=await res.json();
+  stats.innerHTML=`<b>Bets:</b> ${j.n_bets} • <b>ROI:</b> ${(j.roi*100).toFixed(2)}% • <b>Hit:</b> ${(j.hit_rate*100).toFixed(1)}%`;
+  load();
+};
+
+async function load(){
+  const url=new URL('/api/edges', location.origin);
+  if(s.value) url.searchParams.set('sport', s.value);
+  url.searchParams.set('min_edge', me.value||0.02); url.searchParams.set('limit', 500);
+  const res=await fetch(url); const arr=await res.json();
+  t.innerHTML='<tr><th>Sport</th><th>Liga</th><th>Marknad</th><th>Spelare</th><th>Sida</th><th>Line</th><th>Pris</th><th>p_fair</th><th>Edge</th><th>Stake</th><th>PnL</th></tr>';
+  arr.forEach(e=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${e.sport||''}</td><td>${e.league||''}</td><td>${e.market_type||''}</td><td>${e.player||''}</td>
+    <td>${e.side||''}</td><td>${e.line??''}</td><td>${e.price_bet365??''}</td><td>${(e.p_fair||0).toFixed(3)}</td>
+    <td><b>${(e.edge||0).toFixed(3)}</b></td><td>${(e.stake||0).toFixed(3)}</td>
+    <td style="color:${(e.pnl||0)>=0?'#057a55':'#e11d48'}">${(e.pnl||0).toFixed(3)}</td>`;
+    t.appendChild(tr);
+  });
+}
+ref.onclick=load;
+</script>
+""")
+
+@app.post("/api/data/upload")
+async def upload_csv(file: UploadFile = File(...)):
+    data = await file.read()
+    out = HIST_DIR / file.filename
+    out.write_bytes(data)
+    try:
+        _ = pd.read_csv(out, nrows=2)
+    except Exception as e:
+        out.unlink(missing_ok=True)
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "filename": file.filename}
+
+class BacktestResponse(BaseModel):
+    n_bets: int; roi: float; pnl: float; hit_rate: float; kelly_fraction: float
+    by_sport: Dict[str, Dict[str, float]]
+
+@app.post("/api/backtest/run", response_model=BacktestResponse)
+async def api_backtest_run(edge_threshold: float = 0.02, kelly_fraction: float = 0.5):
+    summary = run_backtest(DATA_DIR, edge_threshold=edge_threshold, kelly_fraction=kelly_fraction)
+    return BacktestResponse(**summary)
+
+@app.get("/api/edges")
+async def api_edges(min_edge: float = 0.02, sport: Optional[str] = None, limit: int = 500):
+    res = latest_results()
+    if not res or res.get("edges") is None: return []
+    df = res["edges"].copy()
+    if sport:
+        df = df[df["sport"].astype(str).str.upper() == sport.upper()]
+    df = df[df["edge"] >= min_edge].sort_values("edge", ascending=False).head(limit)
+    return df.to_dict(orient="records")
+
