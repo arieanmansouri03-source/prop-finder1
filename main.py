@@ -1,7 +1,4 @@
-# --- Prop Finder (Railway-friendly) ---
-# Sparar filer i /tmp så att det funkar utan Volumes.
-# När du vill ha permanent lagring: skapa en Volume och byt "/tmp" till "/data".
-
+# --- Prop Finder (Railway-friendly, writes to /tmp) ---
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -13,7 +10,7 @@ import pandas as pd
 import numpy as np
 import json
 
-# ---------- storage (fallback: /tmp) ----------
+# storage -> /tmp (works without volumes)
 DATA_DIR = Path(getenv("DATA_DIR", "/tmp")).resolve()
 HIST_DIR = DATA_DIR / "historical"
 HIST_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,7 +22,6 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# ---------- EV/Backtest engine ----------
 def remove_vig_two_way(p1, p2):
     p1, p2 = float(p1 or 0.0), float(p2 or 0.0)
     s = p1 + p2
@@ -105,7 +101,6 @@ def compute_ev_row(r: dict):
         p_joint = float(r.get("joint_prob", 0.0) or 0.0)
         return ev_decimal(price, p_joint), p_joint
 
-    # fallback
     p_fair = float(r.get("model_prob", 0.0) or 0.0)
     return ev_decimal(price, p_fair), p_fair
 
@@ -169,7 +164,6 @@ def run_backtest(data_dir: Path, edge_threshold: float = 0.02, kelly_fraction: f
     }
     return _CACHE["summary"]
 
-# ---------- API + minimal UI ----------
 class BacktestResponse(BaseModel):
     n_bets: int
     roi: float
@@ -180,7 +174,6 @@ class BacktestResponse(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # Minimal UI inline (ingen extra fil behövs)
     return HTMLResponse("""
 <!doctype html><html lang='sv'><meta charset='utf-8'>
 <title>Prop Finder</title><meta name=viewport content='width=device-width,initial-scale=1'>
@@ -194,5 +187,81 @@ def home():
 <h3>Kör backtest</h3>
 <label>Edge-tröskel <input id=e type=number step=0.01 value=0.02></label>
 <label>Kelly-fraktion <input id=k type=number step=0.1 value=0.5></label>
-<bu
+<button id=r>Kör</button>
+<div id=stats></div>
+<h3>Edges</h3>
+<label>Sportfilter <input id=s placeholder='FOOTBALL'></label>
+<label>Min edge <input id=me type=number step=0.01 value=0.02></label>
+<button id=ref>Uppdatera</button>
+<table id=t></table>
+<script>
+const up=document.getElementById('u'), f=document.getElementById('f'), us=document.getElementById('us');
+const r=document.getElementById('r'), e=document.getElementById('e'), k=document.getElementById('k'), stats=document.getElementById('stats');
+const ref=document.getElementById('ref'), t=document.getElementById('t'), s=document.getElementById('s'), me=document.getElementById('me');
+
+up.onclick=async()=>{
+  if(!f.files[0]){us.textContent='Välj en CSV först.';return;}
+  const fd=new FormData(); fd.append('file', f.files[0]);
+  const res=await fetch('/api/data/upload',{method:'POST',body:fd}); const j=await res.json();
+  us.textContent=j.ok?('Uppladdad: '+j.filename):('Fel: '+j.error);
+};
+
+r.onclick=async()=>{
+  const res=await fetch(`/api/backtest/run?edge_threshold=${e.value||0.02}&kelly_fraction=${k.value||0.5}`,{method:'POST'});
+  const j=await res.json();
+  stats.innerHTML=`<b>Bets:</b> ${j.n_bets} • <b>ROI:</b> ${(j.roi*100).toFixed(2)}% • <b>Hit:</b> ${(j.hit_rate*100).toFixed(1)}%`;
+  load();
+};
+
+ref.onclick=()=>load();
+
+async function load(){
+  const url=new URL('/api/edges', location.origin);
+  if(s.value) url.searchParams.set('sport', s.value);
+  url.searchParams.set('min_edge', me.value||0.02); url.searchParams.set('limit', 500);
+  const res=await fetch(url); const arr=await res.json();
+  t.innerHTML='<tr><th>Sport</th><th>Liga</th><th>Marknad</th><th>Spelare</th><th>Sida</th><th>Line</th><th>Pris</th><th>p_fair</th><th>Edge</th><th>Stake</th><th>PnL</th></tr>';
+  arr.forEach(e=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${e.sport||''}</td><td>${e.league||''}</td><td>${e.market_type||''}</td><td>${e.player||''}</td>
+    <td>${e.side||''}</td><td>${e.line??''}</td><td>${e.price_bet365??''}</td><td>${(e.p_fair||0).toFixed(3)}</td>
+    <td><b>${(e.edge||0).toFixed(3)}</b></td><td>${(e.stake||0).toFixed(3)}</td>
+    <td style="color:${(e.pnl||0)>=0?'#057a55':'#e11d48'}">${(e.pnl||0).toFixed(3)}</td>`;
+    t.appendChild(tr);
+  });
+}
+</script>
+""")
+
+@app.post("/api/data/upload")
+async def upload_csv(file: UploadFile = File(...)):
+    data = await file.read()
+    out = HIST_DIR / file.filename
+    out.write_bytes(data)
+    try:
+        pd.read_csv(out, nrows=2)
+    except Exception as e:
+        out.unlink(missing_ok=True)
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "filename": file.filename}
+
+class BacktestResponse(BaseModel):
+    n_bets: int; roi: float; pnl: float; hit_rate: float; kelly_fraction: float
+    by_sport: Dict[str, Dict[str, float]]
+
+@app.post("/api/backtest/run", response_model=BacktestResponse)
+async def api_backtest_run(edge_threshold: float = 0.02, kelly_fraction: float = 0.5):
+    summary = run_backtest(DATA_DIR, edge_threshold=edge_threshold, kelly_fraction=kelly_fraction)
+    return BacktestResponse(**summary)
+
+@app.get("/api/edges")
+async def api_edges(min_edge: float = 0.02, sport: Optional[str] = None, limit: int = 500):
+    res = latest_results()
+    if not res or res.get("edges") is None:
+        return []
+    df = res["edges"].copy()
+    if sport:
+        df = df[df["sport"].astype(str).str.upper() == sport.upper()]
+    df = df[df["edge"] >= min_edge].sort_values("edge", ascending=False).head(limit)
+    return df.to_dict(orient="records")
 
